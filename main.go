@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -25,85 +24,18 @@ type Message struct {
 	Embedding []float64 `json:"embedding"`
 }
 
-// Generate a random ID for nodes
-func generateID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
+type User struct {
+	UserID      string    `json:"userId"`
+	Name        string    `json:"name"`
+	CreatedAt   int64     `json:"createdAt"`
+	LastActive  int64     `json:"lastActive"`
+	Preferences UserPreferences `json:"preferences"`
 }
 
-// Print a message node that would be added to the graph
-func printMessageNode(sender string, content string, client *openai.Client) {
-	// Get embedding from OpenAI
-	embedding, err := getEmbedding(client, content)
-	if err != nil {
-		log.Printf("Error getting embedding: %v", err)
-		embedding = []float64{} // Fallback to empty embedding
-	}
-	
-	message := Message{
-		MessageID: generateID(),
-		Timestamp: time.Now().Unix(),
-		Sender:    sender,
-		Content:   content,
-		Embedding: embedding,
-	}
-	
-	// Save to JSONL
-	saveAsJSONL(message)
-	
-	// Add to Neo4j and create similarity edges in one transaction
-	if err := addMessageAndCreateEdges(message); err != nil {
-		log.Printf("Error adding message to Neo4j: %v", err)
-	}
-}
-
-// Get embedding from OpenAI text-embedding-3-small
-func getEmbedding(client *openai.Client, text string) ([]float64, error) {
-	resp, err := client.CreateEmbeddings(
-		context.Background(),
-		openai.EmbeddingRequest{
-			Input: []string{text},
-			Model: "text-embedding-3-small",
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	
-	if len(resp.Data) == 0 {
-		return nil, fmt.Errorf("no embedding data received")
-	}
-	
-	// Convert []float32 to []float64
-	embedding := make([]float64, len(resp.Data[0].Embedding))
-	for i, v := range resp.Data[0].Embedding {
-		embedding[i] = float64(v)
-	}
-	return embedding, nil
-}
-
-// Save message as JSONL format
-func saveAsJSONL(message Message) {
-	// Convert message to JSON
-	jsonData, err := json.Marshal(message)
-	if err != nil {
-		log.Printf("Error marshaling message to JSON: %v", err)
-		return
-	}
-	
-	// Append to JSONL file
-	file, err := os.OpenFile("graph_nodes.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("Error opening JSONL file: %v", err)
-		return
-	}
-	defer file.Close()
-	
-	// Write JSON line
-	if _, err := file.WriteString(string(jsonData) + "\n"); err != nil {
-		log.Printf("Error writing to JSONL file: %v", err)
-	}
+type UserPreferences struct {
+	Language        string   `json:"language"`
+	Tone            string   `json:"tone"`
+	AddressingStyle string   `json:"addressingStyle"`
 }
 
 // Neo4j database connection
@@ -131,8 +63,63 @@ func initNeo4j() error {
 	return nil
 }
 
+// Generate a random ID for nodes
+func generateID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+// Get embedding from OpenAI text-embedding-3-small
+func getEmbedding(client *openai.Client, text string) ([]float64, error) {
+	resp, err := client.CreateEmbeddings(
+		context.Background(),
+		openai.EmbeddingRequest{
+			Input: []string{text},
+			Model: "text-embedding-3-small",
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	
+	if len(resp.Data) == 0 {
+		return nil, fmt.Errorf("no embedding data received")
+	}
+	
+	// Convert []float32 to []float64
+	embedding := make([]float64, len(resp.Data[0].Embedding))
+	for i, v := range resp.Data[0].Embedding {
+		embedding[i] = float64(v)
+	}
+	return embedding, nil
+}
+
+// Print a message node that would be added to the graph
+func printMessageNode(sender string, content string, client *openai.Client, userID string) {
+	// Get embedding from OpenAI
+	embedding, err := getEmbedding(client, content)
+	if err != nil {
+		log.Printf("Error getting embedding: %v", err)
+		embedding = []float64{} // Fallback to empty embedding
+	}
+	
+	message := Message{
+		MessageID: generateID(),
+		Timestamp: time.Now().Unix(),
+		Sender:    sender,
+		Content:   content,
+		Embedding: embedding,
+	}
+	
+	// Add to Neo4j and create similarity edges in one transaction
+	if err := addMessageAndCreateEdges(message, userID); err != nil {
+		log.Printf("Error adding message to Neo4j: %v", err)
+	}
+}
+
 // Add message and create similarity edges in a single transaction
-func addMessageAndCreateEdges(message Message) error {
+func addMessageAndCreateEdges(message Message, userID string) error {
 	session := neo4jDriver.NewSession(neo4j.SessionConfig{})
 	defer session.Close()
 	
@@ -141,6 +128,7 @@ func addMessageAndCreateEdges(message Message) error {
 		createQuery := `
 			CREATE (m:Message {
 				messageId: $messageId,
+				userId: $userId,
 				timestamp: $timestamp,
 				sender: $sender,
 				content: $content,
@@ -150,6 +138,7 @@ func addMessageAndCreateEdges(message Message) error {
 		`
 		createParams := map[string]any{
 			"messageId": message.MessageID,
+			"userId":    userID,
 			"timestamp": message.Timestamp,
 			"sender":    message.Sender,
 			"content":   message.Content,
@@ -161,17 +150,53 @@ func addMessageAndCreateEdges(message Message) error {
 			return nil, fmt.Errorf("failed to create message node: %v", err)
 		}
 		
-		fmt.Printf("📊 Added message node to Neo4j: %s\n", message.MessageID)
+		// Link message to user
+		linkQuery := `
+			MATCH (u:User {userId: $userId})
+			MATCH (m:Message {messageId: $messageId})
+			CREATE (u)-[:OWNS]->(m)
+			RETURN u, m
+		`
+		linkParams := map[string]any{
+			"userId":    userID,
+			"messageId": message.MessageID,
+		}
+		
+		_, err = tx.Run(linkQuery, linkParams)
+		if err != nil {
+			return nil, fmt.Errorf("failed to link message to user: %v", err)
+		}
+		
+		// Update user's last active timestamp if it's a human message
+		if message.Sender == "human" {
+			updateQuery := `
+				MATCH (u:User {userId: $userId})
+				SET u.lastActive = $lastActive
+				RETURN u
+			`
+			updateParams := map[string]any{
+				"userId":     userID,
+				"lastActive": time.Now().Unix(),
+			}
+			
+			_, err = tx.Run(updateQuery, updateParams)
+			if err != nil {
+				return nil, fmt.Errorf("failed to update user last active: %v", err)
+			}
+		}
+		
+		fmt.Printf("📊 Added message node to Neo4j: %s (owned by user: %s)\n", message.MessageID, userID)
 		
 		// Then, find similar messages and create edges
 		similarityQuery := `
 			MATCH (m1:Message {messageId: $messageId})
-			MATCH (m2:Message)
+			MATCH (m2:Message {userId: $userId})
 			WHERE m2.messageId <> $messageId
 			RETURN m2.messageId as messageId, m2.embedding as embedding, m2.content as content
 		`
 		similarityParams := map[string]any{
 			"messageId": message.MessageID,
+			"userId":    userID,
 		}
 		
 		result, err := tx.Run(similarityQuery, similarityParams)
@@ -196,9 +221,9 @@ func addMessageAndCreateEdges(message Message) error {
 			
 			// Calculate similarity
 			similarity := cosineSimilarity(message.Embedding, embedding)
-			
-			// Create edge if similarity > 0.1
-			if similarity > 0.7 {
+
+			// Create edge if similarity > 0.5
+			if similarity > 0.5 {
 				// Create the edge in the same transaction
 				edgeQuery := `
 					MATCH (m1:Message {messageId: $messageId1})
@@ -234,6 +259,62 @@ func addMessageAndCreateEdges(message Message) error {
 	}
 	
 	return nil
+}
+
+// Create a new user node
+func createUser(name string) (string, error) {
+	user := User{
+		UserID:     generateID(),
+		Name:       name,
+		CreatedAt:  time.Now().Unix(),
+		LastActive: time.Now().Unix(),
+		Preferences: UserPreferences{
+			Language:        "en",
+			Tone:            "friendly",
+			AddressingStyle: "you",
+		},
+	}
+	
+	session := neo4jDriver.NewSession(neo4j.SessionConfig{})
+	defer session.Close()
+	
+	_, err := session.WriteTransaction(func(tx neo4j.Transaction) (any, error) {
+		query := `
+			CREATE (u:User {
+				userId: $userId,
+				name: $name,
+				createdAt: $createdAt,
+				lastActive: $lastActive,
+				language: $language,
+				tone: $tone,
+				addressingStyle: $addressingStyle
+			})
+			RETURN u
+		`
+		params := map[string]any{
+			"userId":          user.UserID,
+			"name":            user.Name,
+			"createdAt":       user.CreatedAt,
+			"lastActive":      user.LastActive,
+			"language":        user.Preferences.Language,
+			"tone":            user.Preferences.Tone,
+			"addressingStyle": user.Preferences.AddressingStyle,
+		}
+		
+		result, err := tx.Run(query, params)
+		if err != nil {
+			return nil, err
+		}
+		
+		return result.Consume()
+	})
+	
+	if err != nil {
+		return "", fmt.Errorf("failed to create user: %v", err)
+	}
+	
+	fmt.Printf("👤 Created new user: %s (ID: %s)\n", user.Name, user.UserID)
+	return user.UserID, nil
 }
 
 // Calculate cosine similarity between two embeddings
@@ -272,6 +353,12 @@ func main() {
 
 	client := openai.NewClient(apiKey)
 
+	// Create a new user for the conversation
+	userID, err := createUser("Shiny")
+	if err != nil {
+		log.Fatalf("Failed to create user: %v", err)
+	}
+
 	messages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleSystem,
@@ -296,7 +383,7 @@ func main() {
 		}
 
 		// Print user message node
-		printMessageNode("human", userInput, client)
+		printMessageNode("human", userInput, client, userID)
 		
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
@@ -320,7 +407,7 @@ func main() {
 		fmt.Printf("Bot: %s\n", chatbotResponse)
 
 		// Print bot response node
-		printMessageNode("ai", chatbotResponse, client)
+		printMessageNode("ai", chatbotResponse, client, userID)
 
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleAssistant,

@@ -12,6 +12,7 @@ type User = {
 
 type Message = {
   messageId: string;
+  userId: string;
   timestamp: number;
   sender: "human" | "ai";
   content: string;
