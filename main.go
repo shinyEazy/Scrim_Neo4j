@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -47,7 +49,13 @@ func printMessageNode(sender string, content string, client *openai.Client) {
 		Embedding: embedding,
 	}
 	
+	// Save to JSONL
 	saveAsJSONL(message)
+	
+	// Add to Neo4j and create similarity edges in one transaction
+	if err := addMessageAndCreateEdges(message); err != nil {
+		log.Printf("Error adding message to Neo4j: %v", err)
+	}
 }
 
 // Get embedding from OpenAI text-embedding-3-small
@@ -98,6 +106,156 @@ func saveAsJSONL(message Message) {
 	}
 }
 
+// Neo4j database connection
+var neo4jDriver neo4j.Driver
+
+// Initialize Neo4j connection
+func initNeo4j() error {
+	uri := "neo4j://localhost:7687"
+	username := "neo4j"
+	password := "123123123"
+	
+	var err error
+	neo4jDriver, err = neo4j.NewDriver(uri, neo4j.BasicAuth(username, password, ""))
+	if err != nil {
+		return fmt.Errorf("failed to create Neo4j driver: %v", err)
+	}
+	
+	// Test connection
+	err = neo4jDriver.VerifyConnectivity()
+	if err != nil {
+		return fmt.Errorf("failed to connect to Neo4j: %v", err)
+	}
+	
+	fmt.Println("✅ Connected to Neo4j database")
+	return nil
+}
+
+// Add message and create similarity edges in a single transaction
+func addMessageAndCreateEdges(message Message) error {
+	session := neo4jDriver.NewSession(neo4j.SessionConfig{})
+	defer session.Close()
+	
+	_, err := session.WriteTransaction(func(tx neo4j.Transaction) (any, error) {
+		// First, create the message node
+		createQuery := `
+			CREATE (m:Message {
+				messageId: $messageId,
+				timestamp: $timestamp,
+				sender: $sender,
+				content: $content,
+				embedding: $embedding
+			})
+			RETURN m
+		`
+		createParams := map[string]any{
+			"messageId": message.MessageID,
+			"timestamp": message.Timestamp,
+			"sender":    message.Sender,
+			"content":   message.Content,
+			"embedding": message.Embedding,
+		}
+		
+		_, err := tx.Run(createQuery, createParams)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create message node: %v", err)
+		}
+		
+		fmt.Printf("📊 Added message node to Neo4j: %s\n", message.MessageID)
+		
+		// Then, find similar messages and create edges
+		similarityQuery := `
+			MATCH (m1:Message {messageId: $messageId})
+			MATCH (m2:Message)
+			WHERE m2.messageId <> $messageId
+			RETURN m2.messageId as messageId, m2.embedding as embedding, m2.content as content
+		`
+		similarityParams := map[string]any{
+			"messageId": message.MessageID,
+		}
+		
+		result, err := tx.Run(similarityQuery, similarityParams)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query existing messages: %v", err)
+		}
+		
+		edgesCreated := 0
+		totalMessages := 0
+		
+		for result.Next() {
+			totalMessages++
+			record := result.Record()
+			existingMessageId := record.Values[0].(string)
+			existingEmbedding := record.Values[1].([]interface{})
+			
+			// Convert interface{} to []float64
+			embedding := make([]float64, len(existingEmbedding))
+			for i, v := range existingEmbedding {
+				embedding[i] = v.(float64)
+			}
+			
+			// Calculate similarity
+			similarity := cosineSimilarity(message.Embedding, embedding)
+			
+			// Create edge if similarity > 0.1
+			if similarity > 0.7 {
+				// Create the edge in the same transaction
+				edgeQuery := `
+					MATCH (m1:Message {messageId: $messageId1})
+					MATCH (m2:Message {messageId: $messageId2})
+					MERGE (m1)-[r:CONTEXTUAL_LINK {similarity: $similarity, timestamp: $timestamp}]-(m2)
+					RETURN r
+				`
+				edgeParams := map[string]any{
+					"messageId1": message.MessageID,
+					"messageId2": existingMessageId,
+					"similarity": similarity,
+					"timestamp":  time.Now().Unix(),
+				}
+				
+				_, err := tx.Run(edgeQuery, edgeParams)
+				if err != nil {
+					log.Printf("Failed to create edge: %v", err)
+				} else {
+					edgesCreated++
+				}
+			}
+		}
+		
+		if edgesCreated > 0 {
+			fmt.Printf("🔗 Created %d similarity edges for message: %s\n", edgesCreated, message.MessageID)
+		}
+		
+		return result.Consume()
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to add message and create edges: %v", err)
+	}
+	
+	return nil
+}
+
+// Calculate cosine similarity between two embeddings
+func cosineSimilarity(a, b []float64) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0.0
+	}
+	
+	var dotProduct, normA, normB float64
+	for i := 0; i < len(a); i++ {
+		dotProduct += a[i] * b[i]
+		normA += a[i] * a[i]
+		normB += b[i] * b[i]
+	}
+	
+	if normA == 0 || normB == 0 {
+		return 0.0
+	}
+	
+	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -105,6 +263,12 @@ func main() {
 	if apiKey == "" {
 		log.Fatal("Error: OPENAI_API_KEY environment variable not set.")
 	}
+
+	// Initialize Neo4j
+	if err := initNeo4j(); err != nil {
+		log.Fatalf("Failed to initialize Neo4j: %v", err)
+	}
+	defer neo4jDriver.Close()
 
 	client := openai.NewClient(apiKey)
 
