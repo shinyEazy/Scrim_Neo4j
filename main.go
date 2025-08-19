@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -22,6 +23,14 @@ type Message struct {
 	Sender    string    `json:"sender"`
 	Content   string    `json:"content"`
 	Embedding []float64 `json:"embedding"`
+	Topics    []string  `json:"topics"`
+}
+
+type Topic struct {
+	TopicID   string    `json:"topicId"`
+	Name      string    `json:"name"`
+	Embedding []float64 `json:"embedding"`
+	Messages  []Message `json:"messages"`
 }
 
 type User struct {
@@ -95,6 +104,81 @@ func getEmbedding(client *openai.Client, text string) ([]float64, error) {
 	return embedding, nil
 }
 
+// Extract ecommerce topics from content using LLM
+func extractTopics(client *openai.Client, content string) ([]string, error) {
+	resp, err := client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model: "gpt-4o-mini",
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role: openai.ChatMessageRoleSystem,
+					Content: `Phân tích nội dung và gán tag thương mại điện tử phù hợp từ danh sách sau:
+
+Danh sách tag có sẵn:
+["Áo", "Quần", "Giày", "Túi", "Mũ", "Khuyến mãi", "Giảm giá", "Freeship", "Combo"]
+
+Quy tắc gán tag:
+1. Chỉ sử dụng các tag trong danh sách trên
+2. Gán tag dựa trên nội dung thực tế của tin nhắn
+3. Một tin nhắn có thể có nhiều tag
+4. Nếu không có tag phù hợp thì trả về "không có tag"
+
+Trả về danh sách tag phân cách bằng dấu phẩy, không có dấu ngoặc kép.`,
+				},
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: content,
+				},
+			},
+			MaxTokens: 50,
+			Temperature: 0.1,
+		},
+	)
+	
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract topics: %v", err)
+	}
+	
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("no response from topic extraction")
+	}
+	
+	topicsText := resp.Choices[0].Message.Content
+	// Clean up and split topics
+	topicsText = strings.TrimSpace(topicsText)
+	topicsText = strings.Trim(topicsText, `"'`)
+	
+	// Check if no topics found
+	if strings.Contains(strings.ToLower(topicsText), "không có tag") || 
+	   strings.Contains(strings.ToLower(topicsText), "no tag") ||
+	   strings.TrimSpace(topicsText) == "" {
+		return []string{}, nil
+	}
+	
+	// Split by comma and clean each topic
+	topics := strings.Split(topicsText, ",")
+	var cleanedTopics []string
+	
+	// Predefined valid tags
+	validTags := []string{"Áo", "Quần", "Giày", "Túi", "Mũ", "Khuyến mãi", "Giảm giá", "Freeship", "Combo"}
+	
+	for _, topic := range topics {
+		topic = strings.TrimSpace(topic)
+		if topic != "" && topic != "không có tag" {
+			// Only include if it's a valid tag
+			for _, validTag := range validTags {
+				if strings.EqualFold(topic, validTag) {
+					cleanedTopics = append(cleanedTopics, validTag)
+					break
+				}
+			}
+		}
+	}
+	
+	return cleanedTopics, nil
+}
+
 // Print a message node that would be added to the graph
 func printMessageNode(sender string, content string, client *openai.Client, userID string) {
 	// Get embedding from OpenAI
@@ -104,12 +188,20 @@ func printMessageNode(sender string, content string, client *openai.Client, user
 		embedding = []float64{} // Fallback to empty embedding
 	}
 	
+	// Extract topics from content
+	topics, err := extractTopics(client, content)
+	if err != nil {
+		log.Printf("Error extracting topics: %v", err)
+		topics = []string{} // No fallback topic for errors
+	}
+	
 	message := Message{
 		MessageID: generateID(),
 		Timestamp: time.Now().Unix(),
 		Sender:    sender,
 		Content:   content,
 		Embedding: embedding,
+		Topics:    topics,
 	}
 	
 	// Add to Neo4j and create similarity edges in one transaction
@@ -132,7 +224,8 @@ func addMessageAndCreateEdges(message Message, userID string) error {
 				timestamp: $timestamp,
 				sender: $sender,
 				content: $content,
-				embedding: $embedding
+				embedding: $embedding,
+				topics: $topics
 			})
 			RETURN m
 		`
@@ -143,6 +236,7 @@ func addMessageAndCreateEdges(message Message, userID string) error {
 			"sender":    message.Sender,
 			"content":   message.Content,
 			"embedding": message.Embedding,
+			"topics":    message.Topics,
 		}
 		
 		_, err := tx.Run(createQuery, createParams)
@@ -185,7 +279,49 @@ func addMessageAndCreateEdges(message Message, userID string) error {
 			}
 		}
 		
-		fmt.Printf("📊 Added message node to Neo4j: %s (owned by user: %s)\n", message.MessageID, userID)
+		if len(message.Topics) > 0 {
+			fmt.Printf("📊 Added message node to Neo4j: %s (owned by user: %s, topics: %v)\n", message.MessageID, userID, message.Topics)
+		} else {
+			fmt.Printf("📊 Added message node to Neo4j: %s (owned by user: %s, no topics)\n", message.MessageID, userID)
+		}
+		
+		// Create topic nodes and link messages to them (only if topics exist)
+		for _, topicName := range message.Topics {
+			// Create or merge topic node
+			topicQuery := `
+				MERGE (t:Topic {name: $topicName})
+				ON CREATE SET t.topicId = $topicId, t.createdAt = $timestamp
+				RETURN t
+			`
+			topicParams := map[string]any{
+				"topicName": topicName,
+				"topicId":   generateID(),
+				"timestamp": time.Now().Unix(),
+			}
+			
+			_, err := tx.Run(topicQuery, topicParams)
+			if err != nil {
+				log.Printf("Failed to create topic node: %v", err)
+				continue
+			}
+			
+			// Link message to topic
+			linkTopicQuery := `
+				MATCH (m:Message {messageId: $messageId})
+				MATCH (t:Topic {name: $topicName})
+				MERGE (m)-[:BELONGS_TO]->(t)
+				RETURN m, t
+			`
+			linkTopicParams := map[string]any{
+				"messageId": message.MessageID,
+				"topicName": topicName,
+			}
+			
+			_, err = tx.Run(linkTopicQuery, linkTopicParams)
+			if err != nil {
+				log.Printf("Failed to link message to topic: %v", err)
+			}
+		}
 		
 		// Then, find similar messages and create edges
 		similarityQuery := `
@@ -275,6 +411,8 @@ func createUser(name string) (string, error) {
 		},
 	}
 	
+	fmt.Printf("🔄 Attempting to create user with ID: %s\n", user.UserID)
+	
 	session := neo4jDriver.NewSession(neo4j.SessionConfig{})
 	defer session.Close()
 	
@@ -301,11 +439,15 @@ func createUser(name string) (string, error) {
 			"addressingStyle": user.Preferences.AddressingStyle,
 		}
 		
+		fmt.Printf("🔄 Running Neo4j query with params: %+v\n", params)
+		
 		result, err := tx.Run(query, params)
 		if err != nil {
+			fmt.Printf("❌ Neo4j query failed: %v\n", err)
 			return nil, err
 		}
 		
+		fmt.Printf("✅ Neo4j query executed successfully\n")
 		return result.Consume()
 	})
 	
@@ -354,10 +496,12 @@ func main() {
 	client := openai.NewClient(apiKey)
 
 	// Create a new user for the conversation
+	fmt.Println("🔄 Creating new user...")
 	userID, err := createUser("Shiny")
 	if err != nil {
 		log.Fatalf("Failed to create user: %v", err)
 	}
+	fmt.Printf("✅ User created successfully with ID: %s\n", userID)
 
 	messages := []openai.ChatCompletionMessage{
 		{
